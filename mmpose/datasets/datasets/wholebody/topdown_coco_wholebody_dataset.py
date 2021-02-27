@@ -5,8 +5,9 @@ import numpy as np
 from xtcocotools.coco import COCO
 from xtcocotools.cocoeval import COCOeval
 
-from ...registry import DATASETS
-from .topdown_coco_dataset import TopDownCocoDataset
+from mmpose.datasets.datasets.top_down.topdown_coco_dataset import \
+    TopDownCocoDataset
+from mmpose.datasets.registry import DATASETS
 
 
 @DATASETS.register_module()

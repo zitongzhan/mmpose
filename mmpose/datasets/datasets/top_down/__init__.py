@@ -1,6 +1,5 @@
 from .topdown_aic_dataset import TopDownAicDataset
 from .topdown_coco_dataset import TopDownCocoDataset
-from .topdown_coco_wholebody_dataset import TopDownCocoWholeBodyDataset
 from .topdown_crowdpose_dataset import TopDownCrowdPoseDataset
 from .topdown_jhmdb_dataset import TopDownJhmdbDataset
 from .topdown_mhp_dataset import TopDownMhpDataset
