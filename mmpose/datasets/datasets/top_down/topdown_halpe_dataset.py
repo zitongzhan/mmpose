@@ -3,7 +3,6 @@ import warnings
 
 import numpy as np
 from xtcocotools.coco import COCO
-from xtcocotools.cocoeval import COCOeval
 
 from ...registry import DATASETS
 from .topdown_coco_dataset import TopDownCocoDataset
@@ -107,7 +106,7 @@ class TopDownHalpeDataset(TopDownCocoDataset):
         self.img_ids = self.coco.getImgIds()
         self.num_images = len(self.img_ids)
         self.id2name, self.name2id = self._get_mapping_id_name(self.coco.imgs)
-        self.dataset_name = 'coco_wholebody'
+        self.dataset_name = 'halpe'
 
         self.db = self._get_db()
 
@@ -155,6 +154,8 @@ class TopDownHalpeDataset(TopDownCocoDataset):
         # sanitize bboxes
         valid_objs = []
         for obj in objs:
+            if 'bbox' not in obj:
+                continue
             x, y, w, h = obj['bbox']
             x1 = max(0, x)
             y1 = max(0, y)
@@ -165,17 +166,17 @@ class TopDownHalpeDataset(TopDownCocoDataset):
                 valid_objs.append(obj)
         objs = valid_objs
 
-        rec = []
         bbox_id = 0
+        rec = []
         for obj in objs:
+            if 'keypoints' not in obj:
+                continue
             if max(obj['keypoints']) == 0:
                 continue
             joints_3d = np.zeros((num_joints, 3), dtype=np.float32)
             joints_3d_visible = np.zeros((num_joints, 3), dtype=np.float32)
 
-            keypoints = np.array(obj['keypoints'] + obj['foot_kpts'] +
-                                 obj['face_kpts'] + obj['lefthand_kpts'] +
-                                 obj['righthand_kpts']).reshape(-1, 3)
+            keypoints = np.array(obj['keypoints']).reshape(-1, 3)
             joints_3d[:, :2] = keypoints[:, :2]
             joints_3d_visible[:, :2] = np.minimum(1, keypoints[:, 2:3] > 0)
 
@@ -186,6 +187,7 @@ class TopDownHalpeDataset(TopDownCocoDataset):
                 'image_file': image_file,
                 'center': center,
                 'scale': scale,
+                'bbox': obj['clean_bbox'][:4],
                 'rotation': 0,
                 'joints_3d': joints_3d,
                 'joints_3d_visible': joints_3d_visible,
@@ -196,119 +198,3 @@ class TopDownHalpeDataset(TopDownCocoDataset):
             bbox_id = bbox_id + 1
 
         return rec
-
-    def _coco_keypoint_results_one_category_kernel(self, data_pack):
-        """Get coco keypoint results."""
-        cat_id = data_pack['cat_id']
-        keypoints = data_pack['keypoints']
-        cat_results = []
-
-        for img_kpts in keypoints:
-            if len(img_kpts) == 0:
-                continue
-
-            _key_points = np.array(
-                [img_kpt['keypoints'] for img_kpt in img_kpts])
-            key_points = _key_points.reshape(-1,
-                                             self.ann_info['num_joints'] * 3)
-
-            cuts = np.cumsum([
-                0, self.body_num, self.foot_num, self.face_num,
-                self.left_hand_num, self.right_hand_num
-            ]) * 3
-
-            result = [{
-                'image_id': img_kpt['image_id'],
-                'category_id': cat_id,
-                'keypoints': key_point[cuts[0]:cuts[1]].tolist(),
-                'foot_kpts': key_point[cuts[1]:cuts[2]].tolist(),
-                'face_kpts': key_point[cuts[2]:cuts[3]].tolist(),
-                'lefthand_kpts': key_point[cuts[3]:cuts[4]].tolist(),
-                'righthand_kpts': key_point[cuts[4]:cuts[5]].tolist(),
-                'score': float(img_kpt['score']),
-                'center': img_kpt['center'].tolist(),
-                'scale': img_kpt['scale'].tolist()
-            } for img_kpt, key_point in zip(img_kpts, key_points)]
-
-            cat_results.extend(result)
-
-        return cat_results
-
-    def _do_python_keypoint_eval(self, res_file):
-        """Keypoint evaluation using COCOAPI."""
-        coco_det = self.coco.loadRes(res_file)
-
-        coco_eval = COCOeval(
-            self.coco,
-            coco_det,
-            'keypoints_body',
-            np.array(self.sigmas_body),
-            use_area=True)
-        coco_eval.params.useSegm = None
-        coco_eval.evaluate()
-        coco_eval.accumulate()
-        coco_eval.summarize()
-
-        coco_eval = COCOeval(
-            self.coco,
-            coco_det,
-            'keypoints_foot',
-            np.array(self.sigmas_foot),
-            use_area=True)
-        coco_eval.params.useSegm = None
-        coco_eval.evaluate()
-        coco_eval.accumulate()
-        coco_eval.summarize()
-
-        coco_eval = COCOeval(
-            self.coco,
-            coco_det,
-            'keypoints_face',
-            np.array(self.sigmas_face),
-            use_area=True)
-        coco_eval.params.useSegm = None
-        coco_eval.evaluate()
-        coco_eval.accumulate()
-        coco_eval.summarize()
-
-        coco_eval = COCOeval(
-            self.coco,
-            coco_det,
-            'keypoints_lefthand',
-            np.array(self.sigmas_lefthand),
-            use_area=True)
-        coco_eval.params.useSegm = None
-        coco_eval.evaluate()
-        coco_eval.accumulate()
-        coco_eval.summarize()
-
-        coco_eval = COCOeval(
-            self.coco,
-            coco_det,
-            'keypoints_righthand',
-            np.array(self.sigmas_righthand),
-            use_area=True)
-        coco_eval.params.useSegm = None
-        coco_eval.evaluate()
-        coco_eval.accumulate()
-        coco_eval.summarize()
-
-        coco_eval = COCOeval(
-            self.coco,
-            coco_det,
-            'keypoints_wholebody',
-            np.array(self.sigmas_wholebody),
-            use_area=True)
-        coco_eval.params.useSegm = None
-        coco_eval.evaluate()
-        coco_eval.accumulate()
-        coco_eval.summarize()
-
-        stats_names = [
-            'AP', 'AP .5', 'AP .75', 'AP (M)', 'AP (L)', 'AR', 'AR .5',
-            'AR .75', 'AR (M)', 'AR (L)'
-        ]
-
-        info_str = list(zip(stats_names, coco_eval.stats))
-
-        return info_str
