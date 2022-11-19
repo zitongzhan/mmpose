@@ -16,10 +16,11 @@ from ..base_head import BaseHead
 
 OptIntSeq = Optional[Sequence[int]]
 
+import mmdet
 from mmdet.models.dense_heads.mask2former_head import Mask2FormerHead
 
 @MODELS.register_module()
-class PoseMask2FormerHead(BaseHead, Mask2FormerHead):
+class PoseMask2FormerHead(Mask2FormerHead):
     """Top-down heatmap head introduced in `SimCC`_ by Li et al (2022). The
     head is composed of a few deconvolutional layers followed by a fully-
     connected layer to generate 1d representation from low-resolution feature
@@ -84,7 +85,7 @@ class PoseMask2FormerHead(BaseHead, Mask2FormerHead):
 
     def __init__(
         self,
-        keypoint_out_channels,
+        keypoint_out_channels,  # in replace of the original out_channels
         loss: ConfigType = dict(
             type='KeypointMSELoss', use_target_weight=True),
         decoder: OptConfigType = None,
@@ -95,10 +96,12 @@ class PoseMask2FormerHead(BaseHead, Mask2FormerHead):
         # rewrite self.mask_embed to keypoint_out_channels
         feat_channels = kwargs['feat_channels']
         out_channels = kwargs['out_channels']
+
+        self.num_keypoints = keypoint_out_channels
         self.mask_embed = nn.Sequential(
             nn.Linear(feat_channels, feat_channels), nn.ReLU(inplace=True),
             nn.Linear(feat_channels, feat_channels), nn.ReLU(inplace=True),
-            nn.Linear(feat_channels, out_channels))
+            nn.Linear(feat_channels, keypoint_out_channels * out_channels))
 
         self.loss_module = MODELS.build(loss)
         if decoder is not None:
@@ -106,97 +109,72 @@ class PoseMask2FormerHead(BaseHead, Mask2FormerHead):
         else:
             self.decoder = None
 
-    def _make_deconv_head(self,
-                          in_channels: Union[int, Sequence[int]],
-                          out_channels: int,
-                          deconv_type: str = 'Heatmap',
-                          deconv_out_channels: OptIntSeq = (256, 256, 256),
-                          deconv_kernel_sizes: OptIntSeq = (4, 4, 4),
-                          deconv_num_groups: OptIntSeq = (16, 16, 16),
-                          conv_out_channels: OptIntSeq = None,
-                          conv_kernel_sizes: OptIntSeq = None,
-                          has_final_layer: bool = True,
-                          input_transform: str = 'select',
-                          input_index: Union[int, Sequence[int]] = -1,
-                          align_corners: bool = False) -> nn.Module:
-
-        if deconv_type == 'Heatmap':
-            deconv_head = MODELS.build(
-                dict(
-                    type='HeatmapHead',
-                    in_channels=self.in_channels,
-                    out_channels=out_channels,
-                    deconv_out_channels=deconv_out_channels,
-                    deconv_kernel_sizes=deconv_kernel_sizes,
-                    conv_out_channels=conv_out_channels,
-                    conv_kernel_sizes=conv_kernel_sizes,
-                    has_final_layer=has_final_layer,
-                    input_transform=input_transform,
-                    input_index=input_index,
-                    align_corners=align_corners))
-        else:
-            deconv_head = MODELS.build(
-                dict(
-                    type='ViPNASHead',
-                    in_channels=in_channels,
-                    out_channels=out_channels,
-                    deconv_out_channels=deconv_out_channels,
-                    deconv_num_groups=deconv_num_groups,
-                    conv_out_channels=conv_out_channels,
-                    conv_kernel_sizes=conv_kernel_sizes,
-                    has_final_layer=has_final_layer,
-                    input_transform=input_transform,
-                    input_index=input_index,
-                    align_corners=align_corners))
-
-        return deconv_head
-
-    def forward(self, feats: Tuple[Tensor]) -> Tuple[Tensor, Tensor]:
-        """Forward the network. The input is multi scale feature maps and the
-        output is the heatmap.
+    def _forward_head(self, decoder_out: Tensor, mask_feature: Tensor,
+                      attn_mask_target_size: Tuple[int, int]) -> Tuple[Tensor]:
+        """Forward for head part which is called after every decoder layer.
 
         Args:
-            feats (Tuple[Tensor]): Multi scale feature maps.
+            decoder_out (Tensor): in shape (num_queries, batch_size, c).
+            mask_feature (Tensor): in shape (batch_size, c, h, w).
+            attn_mask_target_size (tuple[int, int]): target attention
+                mask size.
 
         Returns:
-            pred_x (Tensor): 1d representation of x.
-            pred_y (Tensor): 1d representation of y.
+            tuple: A tuple contain three elements.
+
+                - cls_pred (Tensor): Classification scores in shape \
+                    (batch_size, num_queries, cls_out_channels). \
+                    Note `cls_out_channels` should includes background.
+                - mask_pred (Tensor): Mask scores in shape \
+                    (batch_size, num_queries,h, w).
+                - attn_mask (Tensor): Attention mask in shape \
+                    (batch_size * num_heads, num_queries, h, w).
         """
-        if self.deconv_head is None:
-            feats = self._transform_inputs(feats)
-            if self.final_layer is not None:
-                feats = self.final_layer(feats)
-        else:
-            feats = self.deconv_head(feats)
+        decoder_out = self.transformer_decoder.post_norm(decoder_out)
+        decoder_out = decoder_out.transpose(0, 1)
+        # shape (num_queries, batch_size, c)
+        cls_pred = self.cls_embed(decoder_out)
+        # shape (num_queries, batch_size, k*c)
+        mask_embed = self.mask_embed(decoder_out)
+        mask_embed = mask_embed.view(mask_embed.size(0), mask_embed.size(1),
+                                     self.num_keypoints, -1)
+        # shape (num_queries, batch_size, k, h, w)
+        mask_pred = torch.einsum('bqkc,bchw->bqkhw', mask_embed, mask_feature)
+        attn_mask = F.interpolate(
+            mask_pred.max(dim=2),  # eliminate the keypoint dimension
+            attn_mask_target_size,
+            mode='bilinear',
+            align_corners=False)
+        # shape (num_queries, batch_size, h, w) ->
+        #   (batch_size * num_head, num_queries, h, w)
+        attn_mask = attn_mask.flatten(2).unsqueeze(1).repeat(
+            (1, self.num_heads, 1, 1)).flatten(0, 1)
+        attn_mask = attn_mask.sigmoid() < 0.3 # TODO: adjusted to a smaller value
+        attn_mask = attn_mask.detach()
 
-        # flatten the output heatmap
-        x = torch.flatten(feats, 2)
+        return cls_pred, mask_pred, attn_mask
+    # def forward(self, feats: Tuple[Tensor]) -> Tensor:
+    #     """Forward the network. The input is multi scale feature maps and the
+    #     output is the heatmap.
 
-        simcc_x = self.mlp_head_x(x)
-        simcc_y = self.mlp_head_y(x)
+    #     Args:
+    #         feats (Tuple[Tensor]): Multi scale feature maps.
 
-        pred_x = F.softmax(simcc_x * self.beta, dim=-1)
-        pred_x = (pred_x * self.linspace_x).sum(dim=-1, keepdim=True)
+    #     Returns:
+    #         Tensor: output heatmap.
+    #     """
+    #     x = self._transform_inputs(feats)
 
-        pred_y = F.softmax(simcc_y * self.beta, dim=-1)
-        pred_y = (pred_y * self.linspace_y).sum(dim=-1, keepdim=True)
+    #     x = self.deconv_layers(x)
+    #     x = self.conv_layers(x)
+    #     x = self.final_layer(x)
 
-        if self.debias:
-            C_x = simcc_x.exp().sum(dim=-1, keepdim=True)
-            pred_x = C_x / (C_x - 1) * (pred_x - 1 / (2 * C_x))
+    #     return x
 
-            C_y = simcc_y.exp().sum(dim=-1, keepdim=True)
-            pred_y = C_x / (C_y - 1) * (pred_y - 1 / (2 * C_y))
-
-        pred = torch.cat([pred_x, pred_y], dim=-1)
-        return pred, simcc_x, simcc_y
-
-    def predict(
-        self,
-        feats: Tuple[Tensor],
-        batch_data_samples: OptSampleList,
-        test_cfg: OptConfigType = {},
-    ) -> InstanceList:
+    def predict(self,
+                feats,
+                batch_data_samples: OptSampleList,
+                test_cfg: ConfigType = {}):
         """Predict results from features.
 
         Args:
@@ -208,7 +186,11 @@ class PoseMask2FormerHead(BaseHead, Mask2FormerHead):
                 to {}
 
         Returns:
-            List[InstanceData]: The pose predictions, each contains
+            Union[InstanceList | Tuple[InstanceList | PixelDataList]]: If
+            ``test_cfg['output_heatmap']==True``, return both pose and heatmap
+            prediction; otherwise only return the pose prediction.
+
+            The pose prediction is a list of ``InstanceData``, each contains
             the following fields:
 
                 - keypoints (np.ndarray): predicted keypoint coordinates in
@@ -216,10 +198,11 @@ class PoseMask2FormerHead(BaseHead, Mask2FormerHead):
                     and D is the keypoint dimension
                 - keypoint_scores (np.ndarray): predicted keypoint scores in
                     shape (num_instances, K)
-                - keypoint_x_labels (np.ndarray, optional): The predicted 1-D
-                    intensity distribution in the x direction
-                - keypoint_y_labels (np.ndarray, optional): The predicted 1-D
-                    intensity distribution in the y direction
+
+            The heatmap prediction is a list of ``PixelData``, each contains
+            the following fields:
+
+                - heatmaps (Tensor): The predicted heatmaps in shape (K, h, w)
         """
 
         if test_cfg.get('flip_test', False):
@@ -227,86 +210,63 @@ class PoseMask2FormerHead(BaseHead, Mask2FormerHead):
             assert isinstance(feats, list) and len(feats) == 2
             flip_indices = batch_data_samples[0].metainfo['flip_indices']
             _feats, _feats_flip = feats
-
-            _batch_pred_x, _batch_pred_y = self.forward(_feats)
-
-            _batch_pred_x_flip, _batch_pred_y_flip = self.forward(_feats_flip)
-            _batch_pred_x_flip, _batch_pred_y_flip = flip_vectors(
-                _batch_pred_x_flip,
-                _batch_pred_y_flip,
-                flip_indices=flip_indices)
-
-            batch_pred_x = (_batch_pred_x + _batch_pred_x_flip) * 0.5
-            batch_pred_y = (_batch_pred_y + _batch_pred_y_flip) * 0.5
+            _batch_heatmaps = self.forward(_feats)
+            _batch_heatmaps_flip = flip_heatmaps(
+                self.forward(_feats_flip),
+                flip_mode=test_cfg.get('flip_mode', 'heatmap'),
+                flip_indices=flip_indices,
+                shift_heatmap=test_cfg.get('shift_heatmap', False))
+            batch_heatmaps = (_batch_heatmaps + _batch_heatmaps_flip) * 0.5
         else:
-            batch_pred_x, batch_pred_y = self.forward(feats)
+            batch_heatmaps = self.forward(feats)
 
-        preds = self.decode((batch_pred_x, batch_pred_y))
+        preds = self.decode(batch_heatmaps)
 
         if test_cfg.get('output_heatmaps', False):
-            for pred_instances, pred_x, pred_y in zip(preds,
-                                                      to_numpy(batch_pred_x),
-                                                      to_numpy(batch_pred_y)):
+            pred_fields = [
+                PixelData(heatmaps=hm) for hm in batch_heatmaps.detach()
+            ]
+            return preds, pred_fields
+        else:
+            return preds
 
-                pred_instances.keypoint_x_labels = pred_x[None]
-                pred_instances.keypoint_y_labels = pred_y[None]
+    def loss(self,
+             feats: Tuple[Tensor],
+             batch_data_samples: OptSampleList,
+             train_cfg: ConfigType = {}) -> dict:
+        """Calculate losses from a batch of inputs and data samples.
 
-        return preds
+        Args:
+            feats (Tuple[Tensor]): The multi-stage features
+            batch_data_samples (List[:obj:`PoseDataSample`]): The batch
+                data samples
+            train_cfg (dict): The runtime config for training process.
+                Defaults to {}
 
-    def loss(
-        self,
-        feats: Tuple[Tensor],
-        batch_data_samples: OptSampleList,
-        train_cfg: OptConfigType = {},
-    ) -> dict:
-        """Calculate losses from a batch of inputs and data samples."""
-
-        pred_x, pred_y = self.forward(feats)
-
-        gt_x = torch.cat([
-            d.gt_instance_labels.keypoint_x_labels for d in batch_data_samples
-        ],
-                         dim=0)
-        gt_y = torch.cat([
-            d.gt_instance_labels.keypoint_y_labels for d in batch_data_samples
-        ],
-                         dim=0)
-        keypoint_weights = torch.cat(
-            [
-                d.gt_instance_labels.keypoint_weights
-                for d in batch_data_samples
-            ],
-            dim=0,
-        )
-
-        pred_simcc = (pred_x, pred_y)
-        gt_simcc = (gt_x, gt_y)
+        Returns:
+            dict: A dictionary of losses.
+        """
+        pred_fields = self.forward(feats)
+        gt_heatmaps = torch.stack(
+            [d.gt_fields.heatmaps for d in batch_data_samples])
+        keypoint_weights = torch.cat([
+            d.gt_instance_labels.keypoint_weights for d in batch_data_samples
+        ])
 
         # calculate losses
         losses = dict()
-        loss = self.loss_module(pred_simcc, gt_simcc, keypoint_weights)
+        loss = self.loss_module(pred_fields, gt_heatmaps, keypoint_weights)
 
         losses.update(loss_kpt=loss)
 
         # calculate accuracy
-        _, avg_acc, _ = simcc_pck_accuracy(
-            output=to_numpy(pred_simcc),
-            target=to_numpy(gt_simcc),
-            simcc_split_ratio=self.simcc_split_ratio,
-            mask=to_numpy(keypoint_weights) > 0,
-        )
+        if train_cfg.get('compute_acc', True):
+            _, avg_acc, _ = pose_pck_accuracy(
+                output=to_numpy(pred_fields),
+                target=to_numpy(gt_heatmaps),
+                mask=to_numpy(keypoint_weights) > 0)
 
-        acc_pose = torch.tensor(avg_acc, device=gt_x.device)
-        losses.update(acc_pose=acc_pose)
+            acc_pose = torch.tensor(avg_acc, device=gt_heatmaps.device)
+            losses.update(acc_pose=acc_pose)
 
         return losses
-
-    @property
-    def default_init_cfg(self):
-        init_cfg = [
-            dict(
-                type='Normal', layer=['Conv2d', 'ConvTranspose2d'], std=0.001),
-            dict(type='Constant', layer='BatchNorm2d', val=1),
-            dict(type='Normal', layer=['Linear'], std=0.01, bias=0),
-        ]
-        return init_cfg
