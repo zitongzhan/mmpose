@@ -21,7 +21,7 @@
             "console": "integratedTerminal",
             "args": [
                 "bu-hm_playground.py",
-                "--work-dir",  "./tmp/2"
+                "--work-dir",  "/tmp/2"
             ],
             "justMyCode": false,
         },
