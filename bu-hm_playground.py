@@ -77,12 +77,13 @@ model = dict(
                 num_branches=4,
                 block='BASIC',
                 num_blocks=(4, 4, 4, 4),
-                num_channels=(48, 96, 192, 384))),
+                num_channels=(48, 96, 192, 384),
+                multiscale_output=True)),
     ),
     head=dict(
         type='PoseMask2FormerHead',
         keypoint_out_channels=17,
-        in_channels=[256, 512, 1024, 2048],  # pass to pixel_decoder inside
+        in_channels=[48, 96, 192, 384],  # pass to pixel_decoder inside
         strides=[4, 8, 16, 32],
         feat_channels=256,
         out_channels=256,
@@ -170,7 +171,20 @@ model = dict(
             reduction='mean',
             naive_dice=True,
             eps=1.0,
-            loss_weight=5.0)),
+            loss_weight=5.0),
+        train_cfg=dict(
+            num_points=12544,
+            oversample_ratio=3.0,
+            importance_sample_ratio=0.75,
+            assigner=dict(
+                type='HungarianAssigner',
+                match_costs=[
+                    dict(type='ClassificationCost', weight=2.0),
+                    dict(
+                        type='CrossEntropyLossCost', weight=5.0, use_sigmoid=True),
+                    dict(type='DiceCost', weight=5.0, pred_act=True, eps=1.0)
+                ]),
+            sampler=dict(type='MaskPseudoSampler')),),
     test_cfg=dict(
         flip_test=True,
         flip_mode='heatmap',
@@ -189,7 +203,7 @@ train_pipeline = [
     dict(type='RandomFlip', direction='horizontal'),
     # dict(type='RandomHalfBody'),
     # dict(type='RandomBBoxTransform'),
-    dict(type='BottomupResize', input_size=codec['input_size'], resize_mode='expand'),
+    dict(type='BottomupResize', input_size=codec['input_size'], resize_mode='fit'),
     dict(type='GenerateTarget', target_type='heatmap+keypoint_label', encoder=codec),
     dict(type='PackPoseInputs')
 ]
